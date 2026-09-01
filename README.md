@@ -6,7 +6,7 @@ It contains the complete 210-operator NVIDIA path used for the paper's **Multi-S
 
 ## Artifact Scope
 
-The full infrastructure implements source--platform evaluation paths through platform-specific runtime and reference adapters. This artifact focuses on the reproducible NVIDIA path shared by the reported analyses.
+The full infrastructure implements source--platform evaluation paths through platform-specific runtime and reference adapters. We use NVIDIA as the reference configuration because it is the most broadly accessible accelerator environment and supports all 210 operators across the three sources. This release is a fully runnable evaluation path rather than a toy demo: it includes the shared task interface, generation pipeline, correctness and performance verification, anti-hack checks, and result analysis. Vendor-specific heterogeneous-platform components remain omitted from the review artifact.
 
 ## Dataset
 
