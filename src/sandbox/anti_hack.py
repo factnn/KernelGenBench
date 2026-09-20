@@ -8,9 +8,13 @@ Three layers of defense:
 """
 
 import ast
+import copy
 import logging
+import random
 from typing import Tuple, List, Callable, Any
 from contextlib import contextmanager
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -205,37 +209,103 @@ def dual_execution_check(
     Returns:
         (is_hack, reason): True if hack detected.
     """
-    import torch
-
-    # Run 1: normal execution
+    # Both executions must start from the same inputs and RNG state. Reusing
+    # kwargs would let an in-place first run contaminate the ghost replay.
     try:
-        out_normal = func(**kwargs)
+        normal_kwargs = copy.deepcopy(kwargs)
+        disabled_kwargs = copy.deepcopy(kwargs)
+    except Exception as exc:
+        logger.debug("Ghost replay input cloning failed: %s", exc)
+        return False, ""
+
+    rng_state = _capture_rng_state()
+
+    # Run 1: normal execution.
+    try:
+        _restore_rng_state(rng_state)
+        out_normal = func(**normal_kwargs)
     except Exception:
         # If normal run fails, can't do comparison
         return False, ""
 
-    # Run 2: with triton.jit disabled
+    # Run 2: with triton.jit disabled, replaying the same initial state.
     try:
+        _restore_rng_state(rng_state)
         with disable_triton_jit():
-            # Re-import the module to pick up the patched triton.jit
-            # The kernel functions become plain python functions
-            out_disabled = func(**kwargs)
+            out_disabled = func(**disabled_kwargs)
     except Exception:
         # If disabled run crashes, triton kernel was actually needed -> not hack
         return False, ""
 
-    # Compare results
-    if out_normal is None and out_disabled is None:
-        # Both None - check in-place outputs via kwargs
+    normal_observation = _execution_observation(out_normal, kwargs, normal_kwargs)
+    disabled_observation = _execution_observation(
+        out_disabled, kwargs, disabled_kwargs
+    )
+    if normal_observation is None and disabled_observation is None:
+        # No returned value and no observable in-place/out= mutation.
         return False, ""
 
-    if _results_match(out_normal, out_disabled, rtol, atol):
+    if _results_match(normal_observation, disabled_observation, rtol, atol):
         return True, (
             "Dual-execution hack detected: output is identical "
             "with triton.jit disabled, indicating no real triton kernel is used."
         )
 
     return False, ""
+
+
+def _capture_rng_state() -> dict:
+    """Capture host and accelerator RNG state for deterministic replay."""
+    import torch
+
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict) -> None:
+    """Restore a state produced by :func:`_capture_rng_state`."""
+    import torch
+
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.random.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _execution_observation(result: Any, before: Any, after: Any) -> Any:
+    """Return values plus observable in-place/out= tensor mutations."""
+    mutations = _changed_tensors(before, after)
+    if result is None and not mutations:
+        return None
+    return result, mutations
+
+
+def _changed_tensors(before: Any, after: Any, path: str = "kwargs") -> dict:
+    """Collect tensors whose value changed between two nested structures."""
+    import torch
+
+    changed = {}
+    if isinstance(before, torch.Tensor) and isinstance(after, torch.Tensor):
+        if not _results_match(before, after, rtol=0.0, atol=0.0):
+            changed[path] = after
+        return changed
+    if isinstance(before, dict) and isinstance(after, dict):
+        for key in before.keys() & after.keys():
+            changed.update(
+                _changed_tensors(before[key], after[key], f"{path}.{key}")
+            )
+        return changed
+    if isinstance(before, (list, tuple)) and isinstance(after, (list, tuple)):
+        for index, (lhs, rhs) in enumerate(zip(before, after)):
+            changed.update(_changed_tensors(lhs, rhs, f"{path}[{index}]"))
+    return changed
 
 
 def _results_match(a: Any, b: Any, rtol: float, atol: float) -> bool:
@@ -256,6 +326,11 @@ def _results_match(a: Any, b: Any, rtol: float, atol: float) -> bool:
         if len(a) != len(b):
             return False
         return all(_results_match(x, y, rtol, atol) for x, y in zip(a, b))
+
+    if isinstance(a, dict) and isinstance(b, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(_results_match(a[k], b[k], rtol, atol) for k in a)
 
     return a == b
 
